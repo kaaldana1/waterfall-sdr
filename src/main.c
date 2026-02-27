@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <rtl-sdr.h>
+#include <SDL3/SDL.h>
 #include <error.h>
 #include <stdio.h>
 #include <stdbool.h>
@@ -10,6 +11,7 @@
 #include <string.h>
 #include <math.h>
 #include <complex.h>
+#include <stdbool.h>
 #include <unistd.h>
 
 /*
@@ -17,17 +19,23 @@
 Frequency resolution of an FFT
 ==================================================
 */
+#define GUI_WINDOW_TITLE "waterfall_sdr"
+#define GUI_WINDOW_WIDTH 800 
+#define GUI_WINDOW_HEIGHT 100
+#define GUI_TEXTURE_HEIGHT (GUI_WINDOW_HEIGHT - 1)
 
 #define POOL_CAPACITY 16
 #define RB_CAPACITY 16
 #define SAMPLES_BUFFER_SIZE (16 * 1024) /* 16KB */
 
-#define SPIT_ERROR(err_code)  \
+#define SPIT_LIBUSB_ERROR(err_code)  \
 	do { \
 		fprintf(stderr, "Error: %s\n", libusb_error_name((err_code))); \
 		return (err_code); \
 	} while (0)
 
+#define MIN(A, B) ((A) < (B) ? (A) : (B))
+#define MAX(A, B) ((A) > (B) ? (A) : (B))
 
 typedef enum 
 {
@@ -38,6 +46,11 @@ typedef enum
 	DSP_BAD_ARGS = -13,
 	DSP_FFT_FAILED = -12,
 	DSP_SIZE_LE_ZERO = -11,
+	GUI_FAILED_START_WINDOW = -10,
+	GUI_FAILED_START_RENDERER = -9,
+	GUI_FAILED_START_TEXTURER = -8, 
+	GUI_FAILED_GET_PRODUCT = -7,
+	GUI_FAILED_UPDATE_TEXTURE = -6,
 } CustomError;
 
 const char *trgt_device_name = "RTL2838UHIDIR";
@@ -75,7 +88,6 @@ typedef enum
 
 pthread_t p_producer_read;
 pthread_t p_consumer_dsp;
-pthread_t p_consumer_gui;
 
 pthread_mutex_t p_mutex_usb_rb_filled;
 pthread_mutex_t p_mutex_usb_rb_free;
@@ -104,42 +116,57 @@ In this setup:
 const int usb_buffer_sample_size = (int)SAMPLES_BUFFER_SIZE; /* 16KB */
 uint8_t usb_samples_buffers[RB_CAPACITY][SAMPLES_BUFFER_SIZE] = {0};
 USBBlock usb_blocks[POOL_CAPACITY] = {0};
-
-USBBlock *usb_pool[POOL_CAPACITY]; 
-
-USBBlock **usb_rb_filled[POOL_CAPACITY]; 
+USBBlock *usb_rb_filled[POOL_CAPACITY];
 int usb_rb_filled_head = 0;
 int usb_rb_filled_tail = 0;
 
-USBBlock **usb_rb_free[POOL_CAPACITY]; 
+USBBlock *usb_rb_free[POOL_CAPACITY];
 int usb_rb_free_head = 0;
-int usb_rb_free_tail = 15; /* all usb_blocks free initially */
+int usb_rb_free_tail = (RB_CAPACITY - 1); /* ring keeps one slot empty */
 
 /* dsp results */
 typedef struct 
 {
-	double complex *FFT;
+	double complex *FFTs_per_usb_block;
+	double *powers;
+	double *decibels;
+	double min_db_per_frame[30];
+	double max_db_per_frame[30];
 } DSPProducts;
 
 /* another pool */
-double complex *dsp_FFT[POOL_CAPACITY];
+
+double complex dsp_FFTs_per_usb_block[POOL_CAPACITY][SAMPLES_BUFFER_SIZE / 2];
+double dsp_powers[POOL_CAPACITY][SAMPLES_BUFFER_SIZE / 2];
+double dsp_decibels[POOL_CAPACITY][SAMPLES_BUFFER_SIZE / 2];
+
 DSPProducts dsp_products[POOL_CAPACITY];
-
-DSPProducts *dsp_pool[POOL_CAPACITY];
-
-DSPProducts **dsp_rb_filled[POOL_CAPACITY]; 
+DSPProducts *dsp_rb_filled[POOL_CAPACITY];
 int dsp_rb_filled_head = 0;
 int dsp_rb_filled_tail = 0;
 
-DSPProducts **dsp_rb_free[POOL_CAPACITY]; 
+DSPProducts *dsp_rb_free[POOL_CAPACITY];
 int dsp_rb_free_head = 0;
-int dsp_rb_free_tail = 15; 
+int dsp_rb_free_tail = (RB_CAPACITY - 1);
+
+
+typedef struct 
+{
+	SDL_Window *window;
+	SDL_Renderer *renderer;
+	SDL_Texture *texture;
+	SDL_PixelFormatDetails format_details;
+} GUI_SDL;
+
+uint32_t gui_sdl_palette[256];
+uint32_t rgba_pixel_buff[SAMPLES_BUFFER_SIZE / 2] = {0}; 
+
+int running = 1;
 
 void print_waterfall_info(DevConfig *);
 void *p_read_routine(void *);
 void *p_consumer_dsp_routine(void *);
-void *p_consumer_gui_routine(void *);
-void *p_consumer_gui_routine(void *);
+
 int dev_open(DevTarget *);
 int dev_configure(rtlsdr_dev_t *, int sample_rate, int center_freq, int tuner_gain_mode, int tuner_gain);
 int DSP(USBBlock *, DevTarget *, DSPProducts *);
@@ -147,7 +174,16 @@ double complex DSP_iq_to_complex(uint8_t I_sample, uint8_t Q_sample);
 int DSP_FFT_in_place(double complex *x, int fft_size, int sign);
 int DSP_reverse_bit(int i, int bits);
 int DSP_hann_window(double complex *x, int fft_size);
+double DSP_calculate_power(double complex dft_coeff);
+DSPProducts *gui_sdl_get_products();
 
+int gui_sdl_return_products(DSPProducts *products);
+int gui_sdl_db_to_rgba(DevConfig *config, DSPProducts *products, int start, uint32_t *rgba_work_buffer, 
+					   double max_db, double min_db);
+int gui_sdl_render_row(GUI_SDL *g, DevConfig *config, uint32_t *rgba_buffer_per_fft_frame, int row_scroll_pos);
+int gui_sdl_destroy(GUI_SDL *g);
+int gui_sdl_init(GUI_SDL *g, DevConfig *config);
+int gui_sdl_waterfall(GUI_SDL *g, DevConfig *config);
 
 int main(int argc, char **argv)
 {
@@ -174,30 +210,33 @@ int main(int argc, char **argv)
 
 	print_waterfall_info(&config);
 	
+	
 	DevTarget dev;
 	dev.config = &config;
 
 	r = dev_open(&dev);
-	if (r < 0) { SPIT_ERROR(r); }
+	if (r < 0) { SPIT_LIBUSB_ERROR(r); }
 
 	r = dev_configure(dev.dev_ptr, config.sample_rate, config.center_freq, config.tuner_gain_mode, config.tuner_gain);
-	if (r < 0) { SPIT_ERROR(r); }
+	if (r < 0) { SPIT_LIBUSB_ERROR(r); }
 
 	r = rtlsdr_reset_buffer(dev.dev_ptr);
-	if (r < 0) { SPIT_ERROR(r); }
+	if (r < 0) { SPIT_LIBUSB_ERROR(r); }
 
 	
-	/* Initialize pools */
+	/* Initialize pools. Ring buffer design keeps one slot empty. */
 	for (int i = 0; i < POOL_CAPACITY; i++)
 	{
 		usb_blocks[i].usb_samples_buffer = usb_samples_buffers[i];
-		usb_pool[i] = &usb_blocks[i];
-		usb_rb_free[i] = &usb_pool[i];
 
-		dsp_FFT[i] = (double complex *)malloc((size_t)config.fft_size * sizeof(double complex));
-		dsp_products[i].FFT = dsp_FFT[i];
-		dsp_pool[i] = &dsp_products[i];
-		dsp_rb_free[i] = &dsp_pool[i];
+		dsp_products[i].FFTs_per_usb_block = dsp_FFTs_per_usb_block[i];
+		dsp_products[i].powers = dsp_powers[i];
+		dsp_products[i].decibels = dsp_decibels[i];
+		if (i < (rb_capacity - 1))
+		{
+			usb_rb_free[i] = &usb_blocks[i];
+			dsp_rb_free[i] = &dsp_products[i];
+		}
 	}
 
 	/* start producer thread (reading from rtl_sdr dongle)*/
@@ -206,12 +245,16 @@ int main(int argc, char **argv)
 	pthread_mutex_init(&p_mutex_dsp_rb_filled, NULL);
 	pthread_mutex_init(&p_mutex_dsp_rb_free, NULL);
 	sem_init(&p_sem_usb_rb_full, 0, 0);
-	sem_init(&p_sem_usb_rb_empty, 0, rb_capacity);
+	sem_init(&p_sem_usb_rb_empty, 0, rb_capacity - 1);
 	sem_init(&p_sem_dsp_rb_full, 0, 0);
-	sem_init(&p_sem_dsp_rb_empty, 0, rb_capacity);
+	sem_init(&p_sem_dsp_rb_empty, 0, rb_capacity - 1);
 	if (pthread_create(&p_producer_read, NULL, &p_read_routine, &dev) != 0) { printf("Failed to create producer thread\n"); goto cleanup; }
 	if (pthread_create(&p_consumer_dsp, NULL, &p_consumer_dsp_routine, &dev) != 0) { printf("Failed to create consumer dsp thread\n"); goto cleanup; }
-	if (pthread_create(&p_consumer_gui, NULL, &p_consumer_gui_routine, &dev) != 0) { printf("Failed to create consumer gui thread\n"); goto cleanup; }
+	
+	GUI_SDL gui;
+	r = gui_sdl_init(&gui, &config);
+	if (r < 0) { return r; }
+	r = gui_sdl_waterfall(&gui, &config);
 
 	pthread_join(p_producer_read, NULL);
 	pthread_join(p_consumer_dsp, NULL);
@@ -225,7 +268,7 @@ int main(int argc, char **argv)
 	free(dev.product);
 	free(dev.serial);
 	rtlsdr_close(dev.dev_ptr);
-	return 0;
+	exit(1);
 }
 
 void print_waterfall_info(DevConfig *config)
@@ -314,7 +357,7 @@ int dev_configure(rtlsdr_dev_t *dev, int sample_rate, int center_freq, int tuner
     return 0;
 }
 
-static inline int rb_enqueue(void ***rb, const int head, int *tail, void **block)
+static inline int rb_enqueue(void **rb, const int head, int *tail, void *block)
 {
 	/* buffer is either full or empty when head == tail */
 	int next = (*tail + 1) % rb_capacity;
@@ -325,11 +368,11 @@ static inline int rb_enqueue(void ***rb, const int head, int *tail, void **block
 	return 0;
 }
 
-static inline void **rb_dequeue(void ***rb, int *head, const int tail)
+static inline void *rb_dequeue(void **rb, int *head, const int tail)
 {
 	if (*head == tail)  /* buffer is empty */ return NULL;
 	
-	void **block = rb[*head];
+	void *block = rb[*head];
 	*head = (*head + 1) % rb_capacity;
 	return block;
 }
@@ -343,24 +386,40 @@ void *p_read_routine(void *dev)
 	{
 		sem_wait(&p_sem_usb_rb_empty); /* free queue - 1 */
 		pthread_mutex_lock(&p_mutex_usb_rb_free);
-		USBBlock **block_pp = (USBBlock**)rb_dequeue((void***)usb_rb_free, &usb_rb_free_head, usb_rb_free_tail);
-		if (block_pp == NULL) { printf("USB free buffer is empty\n"); pthread_mutex_unlock(&p_mutex_usb_rb_free); continue; }
+		USBBlock *block = (USBBlock*)rb_dequeue((void**)usb_rb_free, &usb_rb_free_head, usb_rb_free_tail);
+		if (block == NULL) { printf("USB free buffer is empty\n"); pthread_mutex_unlock(&p_mutex_usb_rb_free); sem_post(&p_sem_usb_rb_empty); continue; }
 		pthread_mutex_unlock(&p_mutex_usb_rb_free);
 
-		USBBlock *block = (block_pp != NULL) ? *block_pp : NULL;
 		if (block == NULL) { printf("nullptr \n"); continue; }
 
 		uint8_t *usb_samples_buffer = block->usb_samples_buffer;
 		int n_read;
 		int r = rtlsdr_read_sync(dev_ptr, (void*)usb_samples_buffer, usb_buffer_sample_size, &n_read);
 		if (r < 0) { return NULL; }
+		if (n_read != SAMPLES_BUFFER_SIZE)
+		{
+			printf("Short read, dropping this sample\n");
+			usb_samples_buffer[0] = 0;
+			pthread_mutex_lock(&p_mutex_usb_rb_free);
+			rb_enqueue((void**)usb_rb_free, usb_rb_free_head, &usb_rb_free_tail, (void*)block);
+			pthread_mutex_unlock(&p_mutex_usb_rb_free);
+			sem_post(&p_sem_usb_rb_empty);
+			continue;
+		}
 		block->usb_n_samples = n_read;
 
-		printf("In PRODUCER: with %d samples\n", block->usb_n_samples);
 
 		pthread_mutex_lock(&p_mutex_usb_rb_filled);
-		r = rb_enqueue((void***)usb_rb_filled, usb_rb_filled_head, &usb_rb_filled_tail, (void**)block_pp);
+		r = rb_enqueue((void**)usb_rb_filled, usb_rb_filled_head, &usb_rb_filled_tail, (void*)block);
 		pthread_mutex_unlock(&p_mutex_usb_rb_filled);
+		if (r < 0)
+		{
+			pthread_mutex_lock(&p_mutex_usb_rb_free);
+			rb_enqueue((void**)usb_rb_free, usb_rb_free_head, &usb_rb_free_tail, (void*)block);
+			pthread_mutex_unlock(&p_mutex_usb_rb_free);
+			sem_post(&p_sem_usb_rb_empty);
+			continue;
+		}
 		sem_post(&p_sem_usb_rb_full); /* filled queue + 1*/
 	}
 	return NULL;
@@ -374,85 +433,84 @@ void *p_consumer_dsp_routine(void *device)
 	{
 		sem_wait(&p_sem_usb_rb_full);
 		pthread_mutex_lock(&p_mutex_usb_rb_filled);
-		USBBlock **block_pp = (USBBlock**)rb_dequeue((void***)usb_rb_filled, &usb_rb_filled_head, usb_rb_filled_tail);
+		USBBlock *block = (USBBlock*)rb_dequeue((void**)usb_rb_filled, &usb_rb_filled_head, usb_rb_filled_tail);
 		pthread_mutex_unlock(&p_mutex_usb_rb_filled); 
 
-		USBBlock *block = (block_pp != NULL) ? *block_pp : NULL;
-		if (block == NULL) { printf("nullptr \n"); continue; }
+		if (block == NULL) { printf("nullptr \n"); sem_post(&p_sem_usb_rb_full); continue; }
 
 		sem_wait(&p_sem_dsp_rb_empty);
 		pthread_mutex_lock(&p_mutex_dsp_rb_free);
-		DSPProducts **products_pp = (DSPProducts**)rb_dequeue((void***)dsp_rb_free, &dsp_rb_free_head, dsp_rb_free_tail);
-		if (products_pp == NULL) { printf("DSP free buffer is empty\n"); pthread_mutex_unlock(&p_mutex_dsp_rb_free); continue; }
+		DSPProducts *products = (DSPProducts*)rb_dequeue((void**)dsp_rb_free, &dsp_rb_free_head, dsp_rb_free_tail);
+		if (products == NULL)
+		{
+			printf("DSP free buffer is empty\n");
+			pthread_mutex_unlock(&p_mutex_dsp_rb_free);
+			sem_post(&p_sem_dsp_rb_empty);
+			pthread_mutex_lock(&p_mutex_usb_rb_filled);
+			rb_enqueue((void**)usb_rb_filled, usb_rb_filled_head, &usb_rb_filled_tail, (void*)block);
+			pthread_mutex_unlock(&p_mutex_usb_rb_filled);
+			sem_post(&p_sem_usb_rb_full);
+			continue;
+		}
 		pthread_mutex_unlock(&p_mutex_dsp_rb_free);
 
-		DSPProducts *products = (products_pp != NULL) ? *products_pp : NULL;
 		if (products == NULL) { printf("nullptr \n"); continue; }
-
-		printf("In CONSUMER: with %d samples\n", block->usb_n_samples);
 
 		int r = DSP(block, dev, products);
-		if (r < 0) { printf("DSP processing failed with error code %d\n", r); continue; }
-
-		pthread_mutex_lock(&p_mutex_dsp_rb_filled);
-		r = rb_enqueue((void***)dsp_rb_filled, dsp_rb_filled_head, &dsp_rb_filled_tail, (void**)products_pp);
-		pthread_mutex_unlock(&p_mutex_dsp_rb_filled);
-		sem_post(&p_sem_dsp_rb_full);  
-
-		pthread_mutex_lock(&p_mutex_usb_rb_free);
-		r = rb_enqueue((void***)usb_rb_free, usb_rb_free_head, &usb_rb_free_tail, (void**)block_pp);
-		pthread_mutex_unlock(&p_mutex_usb_rb_free);
-		sem_post(&p_sem_usb_rb_empty); /* free queue + 1 */
-	}
-	return NULL;
-}
-
-void *p_consumer_gui_routine(void *device)
-{
-	DevTarget *dev = (DevTarget*)device;
-	while(1)
-	{
-		sem_wait(&p_sem_dsp_rb_full);
-		pthread_mutex_lock(&p_mutex_dsp_rb_filled);
-		DSPProducts **products_pp = (DSPProducts**)rb_dequeue((void***)dsp_rb_filled, &dsp_rb_filled_head, dsp_rb_filled_tail);
-		if (products_pp == NULL) { printf("DSP filled buffer is empty\n"); pthread_mutex_unlock(&p_mutex_dsp_rb_filled); continue; }
-		pthread_mutex_unlock(&p_mutex_dsp_rb_filled);
-
-		DSPProducts *products = (products_pp != NULL) ? *products_pp : NULL;
-		if (products == NULL) { printf("nullptr \n"); continue; }
-
-		for(int i = 0; i < dev->config->fft_size; i++)
+		if (r < 0)
 		{
-			double complex val = products->FFT[i];
-			if (creal(val) != 0.0 || cimag(val) != 0.0)
-				printf("FFT Bin %d: %f + %fi\n", i, creal(val), cimag(val));
+			printf("DSP processing failed with error code %d\n", r);
+			pthread_mutex_lock(&p_mutex_dsp_rb_free);
+			rb_enqueue((void**)dsp_rb_free, dsp_rb_free_head, &dsp_rb_free_tail, (void*)products);
+			pthread_mutex_unlock(&p_mutex_dsp_rb_free);
+			sem_post(&p_sem_dsp_rb_empty);
+			pthread_mutex_lock(&p_mutex_usb_rb_free);
+			rb_enqueue((void**)usb_rb_free, usb_rb_free_head, &usb_rb_free_tail, (void*)block);
+			pthread_mutex_unlock(&p_mutex_usb_rb_free);
+			sem_post(&p_sem_usb_rb_empty);
+			continue;
 		}
 
-		pthread_mutex_lock(&p_mutex_dsp_rb_free);
-		int r = rb_enqueue((void***)dsp_rb_free, dsp_rb_free_head, &dsp_rb_free_tail, (void**)products_pp);
-		pthread_mutex_unlock(&p_mutex_dsp_rb_free);
-		sem_post(&p_sem_dsp_rb_empty); /* free queue + 1 */
+		pthread_mutex_lock(&p_mutex_dsp_rb_filled);
+		r = rb_enqueue((void**)dsp_rb_filled, dsp_rb_filled_head, &dsp_rb_filled_tail, (void*)products);
+		pthread_mutex_unlock(&p_mutex_dsp_rb_filled);
+		if (r < 0)
+		{
+			pthread_mutex_lock(&p_mutex_dsp_rb_free);
+			rb_enqueue((void**)dsp_rb_free, dsp_rb_free_head, &dsp_rb_free_tail, (void*)products);
+			pthread_mutex_unlock(&p_mutex_dsp_rb_free);
+			sem_post(&p_sem_dsp_rb_empty);
+		}
+		else
+		{
+			sem_post(&p_sem_dsp_rb_full);
+		}
+
+		pthread_mutex_lock(&p_mutex_usb_rb_free);
+		r = rb_enqueue((void**)usb_rb_free, usb_rb_free_head, &usb_rb_free_tail, (void*)block);
+		pthread_mutex_unlock(&p_mutex_usb_rb_free);
+		if (r >= 0) sem_post(&p_sem_usb_rb_empty); /* free queue + 1 */
 	}
 	return NULL;
 }
+
 
 
 int DSP(USBBlock *usb_block, DevTarget *dev, DSPProducts *products)
 {
 	if (products == NULL || usb_block == NULL || dev->config == NULL ) { return DSP_BAD_ARGS; }
-	printf("Performing DSP on block with %d samples\n", usb_block->usb_n_samples);
 	
     if (usb_block->usb_n_samples < 2 || (usb_block->usb_n_samples % 2) != 0) {  return DSP_MISSING_IQ_PAIRS; /* must have whole IQ pairs */ }
 
-	int usb_n_complex = (usb_block->usb_n_samples)/2;
+	int usb_n_complex = (usb_block->usb_n_samples) / 2;
 	if (usb_n_complex % dev->config->fft_size != 0) { return DSP_MISMATCH_FFT_SIZE; }
 
 
 	int fft_size = dev->config->fft_size;
-	if (((fft_size - 1) & fft_size) != 0) { return DSP_NOT_RADIX_2; }
+	if (fft_size <= 0 || ((fft_size - 1) & fft_size) != 0) { return DSP_NOT_RADIX_2; }
 
 	uint8_t *buffer = usb_block->usb_samples_buffer;
-    double complex *fft_work_buffer = products->FFT;
+    double complex *fft_work_buffer = products->FFTs_per_usb_block;
 
 	if (fft_work_buffer == NULL) { return -1; }
 
@@ -461,18 +519,43 @@ int DSP(USBBlock *usb_block, DevTarget *dev, DSPProducts *products)
 		fft_work_buffer[i/2] = DSP_iq_to_complex(buffer[i], buffer[i + 1]);
 	}
 
-	int ffts_per_usb_block = usb_n_complex / fft_size;
+	int ffts_count_per_usb_block = usb_n_complex / fft_size;
 
-	for (int ffts_count = 0; ffts_count < ffts_per_usb_block; ffts_count++)
+	for (int ffts_count = 0; ffts_count < ffts_count_per_usb_block; ffts_count++)
 	{
+
 		int start = ffts_count * fft_size;
 		double complex *fft_frame = &fft_work_buffer[start];
 		int r = DSP_hann_window(fft_frame, fft_size);
 		if (r < 0) { return r; }
 		r  = DSP_FFT_in_place(fft_frame, fft_size, -1);
 		if (r < 0) {  return r; }
+
+		products->min_db_per_frame[ffts_count] = INFINITY;
+		products->max_db_per_frame[ffts_count] = -INFINITY;
+
+		for (int i = 0; i < fft_size; i++)
+		{
+			double power = DSP_calculate_power(fft_frame[i]);
+			/* power -> compress dynamic range -- decibels -> scale given a max_db and min_db window */
+			products->powers[start + i] = power;
+			products->decibels[start + i] = 10.0 * log10(power + 1e-10); 
+			products->min_db_per_frame[ffts_count] = MIN(products->min_db_per_frame[ffts_count], products->decibels[start + i]);
+			products->max_db_per_frame[ffts_count] = MAX(products->max_db_per_frame[ffts_count], products->decibels[start + i]);
+		}
+
 	}
+
+
 	return 0;
+}
+
+/* for each FFT bin's complex frequency-domain sample, we get the power */
+double DSP_calculate_power(double complex dft_coeff)
+{
+	double re = creal(dft_coeff);
+	double im = cimag(dft_coeff);
+	return (re*re + im*im);
 }
 
 /* Applied in the time domain:
@@ -521,8 +604,10 @@ int DSP_FFT_in_place(double complex *x, int fft_size, int sign)
 	Butterfly Stages:
 	This grows the FFT size to m^2 
 
-	We define smaller FFTs first: E[k] and O[k],
+	We define smaller FFTs first: E[k] and O[k], 
 	then X[k] = E[k] + Wkn * O[k]
+	Where E[k] is even-numbered and represents how much cosine component at that frequency
+		  O[k] is odd-numbered and represents how much sine component at that frequency
 
 	Butterfly: Given two values, (top, bottom)
 	Where (top,bottom) = (even_part,odd_part) = (reference_vector,vector_to_be_phase_aligned)
@@ -598,4 +683,138 @@ int DSP_reverse_bit(int i, int bits)
         i >>= 1;
     }
     return reversed;
+}
+
+
+int gui_sdl_init(GUI_SDL *g, DevConfig *config)
+{
+	if (!SDL_Init(SDL_INIT_VIDEO)) { return GUI_FAILED_START_WINDOW; };
+
+	g->window = SDL_CreateWindow(GUI_WINDOW_TITLE, GUI_WINDOW_WIDTH, GUI_WINDOW_HEIGHT, 0);
+	if (g->window == NULL) { return GUI_FAILED_START_WINDOW; }
+
+	g->renderer = SDL_CreateRenderer(g->window, NULL);
+	if (g->renderer == NULL) { return GUI_FAILED_START_RENDERER; }
+
+	/* Pitch = width * format = 8192 * 4 (bytes per pixel--according to RGBA) = 32768 bytes*/
+	/* pixel width of a row determined by N bins */
+	int pixel_width = config->fft_size;
+	g->texture = SDL_CreateTexture(g->renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, pixel_width, GUI_TEXTURE_HEIGHT);
+	if (g->texture == NULL) { return GUI_FAILED_START_TEXTURER; }
+
+	g->format_details = *SDL_GetPixelFormatDetails(SDL_PIXELFORMAT_RGBA32);
+
+	/* initialize palette with MapRGBA*/
+	for (int i = 0; i < 256; i++) {
+		gui_sdl_palette[i] = SDL_MapRGBA(&g->format_details, NULL, i, 0, 0, 255);
+	}
+
+    return 0;
+}
+
+int gui_sdl_destroy(GUI_SDL *g)
+{
+	SDL_DestroyTexture(g->texture);
+	SDL_DestroyRenderer(g->renderer);
+	SDL_DestroyWindow(g->window);
+	return 0;
+}
+
+int gui_sdl_waterfall(GUI_SDL *g, DevConfig *config) 
+{
+	int row_scroll_pos = 0;
+    while (running) 
+	{
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) 
+		{
+            if (e.type == SDL_EVENT_QUIT) { running = 0; break; }
+        }
+
+		DSPProducts *products = gui_sdl_get_products();
+		if (products == NULL) { printf("nullptr \n"); gui_sdl_destroy(g); SDL_Quit(); return GUI_FAILED_GET_PRODUCT; }
+
+		int usb_n_complex = (SAMPLES_BUFFER_SIZE / 2);
+
+		int ffts_count_per_usb_block = (usb_n_complex) / config->fft_size;
+		for (int ffts_count = 0; ffts_count < ffts_count_per_usb_block; ffts_count++)
+		{
+			int start = ffts_count * config->fft_size;
+			uint32_t *pixel_buff_per_fft_frame = &rgba_pixel_buff[start];
+
+			int r = gui_sdl_db_to_rgba(config, products, start, pixel_buff_per_fft_frame, 
+									  products->max_db_per_frame[ffts_count], products->min_db_per_frame[ffts_count]);
+			if (r < 0) { gui_sdl_return_products(products); return r; }
+
+			r = gui_sdl_render_row(g, config, pixel_buff_per_fft_frame, row_scroll_pos);
+			if (r < 0) { gui_sdl_return_products(products); return r; }
+			row_scroll_pos = (row_scroll_pos + 1) % GUI_TEXTURE_HEIGHT;
+
+		}
+		
+		gui_sdl_return_products(products);
+		if (!SDL_SetRenderDrawColor(g->renderer, 0, 0, 0, 255)) { return GUI_FAILED_UPDATE_TEXTURE; }
+		if (!SDL_RenderClear(g->renderer)) { return GUI_FAILED_UPDATE_TEXTURE; }
+		if (!SDL_RenderTexture(g->renderer, g->texture, NULL, NULL)) { return GUI_FAILED_UPDATE_TEXTURE; }
+		if (!SDL_RenderPresent(g->renderer)) { return GUI_FAILED_UPDATE_TEXTURE; }
+		SDL_Delay(16);
+    }
+	gui_sdl_destroy(g);
+    SDL_Quit();
+    return 0;
+}
+
+int gui_sdl_db_to_rgba(DevConfig *config, DSPProducts *products, int start, uint32_t *rgba_work_buffer, 
+					   double max_db, double min_db)
+{
+	// very rarely the max_db and min_db can be the same if the FFT frame is silent, so we check to prevent division by zero
+	if (max_db - min_db < 1e-6) { for (int i = 0; i < config->fft_size; i++) rgba_work_buffer[i] = gui_sdl_palette[0]; return 0; }
+
+
+	for (int fft_bin = 0; fft_bin < config->fft_size; fft_bin++)
+	{
+		/* this scales decibels to fit in the range of [0, 255] for RGB rendering */
+		double db = products->decibels[start + fft_bin];
+		/* scaled_db puts db in the range 0 -> 1. max and min are autoscaled */
+		double scaled_db = (db - min_db) / (max_db - min_db);
+		if (scaled_db < 0.0) scaled_db = 0.0;
+		if (scaled_db > 1.0) scaled_db = 1.0;
+
+		/* convert this double scaled_db to an integer that fits palette index */
+		int palette_index = (int)(scaled_db * 255.0); /* scale to [0, 255] */
+		rgba_work_buffer[fft_bin] = gui_sdl_palette[palette_index];
+	}
+	return 0;
+
+}
+
+int gui_sdl_render_row(GUI_SDL *g, DevConfig *config, uint32_t *rgba_buffer_per_fft_frame, int row_scroll_pos)
+{
+	int pitch = config->fft_size * 4; /* width * bytes per pixel */
+	SDL_Rect rect = {.x = 0, .y = row_scroll_pos, .w = config->fft_size, .h = 1};
+	bool r = SDL_UpdateTexture(g->texture, &rect, rgba_buffer_per_fft_frame, pitch);
+	if (!r) { return GUI_FAILED_UPDATE_TEXTURE; }
+	return 0;
+
+}
+
+
+DSPProducts *gui_sdl_get_products()
+{
+	sem_wait(&p_sem_dsp_rb_full);
+	pthread_mutex_lock(&p_mutex_dsp_rb_filled);
+	DSPProducts *products = (DSPProducts*)rb_dequeue((void**)dsp_rb_filled, &dsp_rb_filled_head, dsp_rb_filled_tail);
+	if (products == NULL) { printf("DSP filled buffer is empty\n"); pthread_mutex_unlock(&p_mutex_dsp_rb_filled); sem_post(&p_sem_dsp_rb_full); return NULL; }
+	pthread_mutex_unlock(&p_mutex_dsp_rb_filled);
+
+	return products;
+}
+
+int gui_sdl_return_products(DSPProducts *products)
+{
+	pthread_mutex_lock(&p_mutex_dsp_rb_free);
+	int r = rb_enqueue((void**)dsp_rb_free, dsp_rb_free_head, &dsp_rb_free_tail, (void*)products);
+	pthread_mutex_unlock(&p_mutex_dsp_rb_free);
+	if (r >= 0) sem_post(&p_sem_dsp_rb_empty); /* free queue + 1 */
+	return r;
 }
