@@ -79,9 +79,9 @@ typedef struct
 typedef enum
 {
 	DEFAULT_SAMPLE_RATE = 2048000,
-	DEFAULT_CENTER_FREQ = 433920000,
+	DEFAULT_CENTER_FREQ = 100000000,
 	DEFAULT_TUNER_GAIN_MODE = 1,
-	DEFAULT_TUNER_GAIN = 400, 
+	DEFAULT_TUNER_GAIN = 200, 
 	DEFAULT_FFT_SIZE = (SAMPLES_BUFFER_SIZE / 2),
 } DevConfigDefaults;
 
@@ -200,11 +200,36 @@ int main(int argc, char **argv)
 	int i = 0;
 	while (i < argc)
 	{
+
 		if (strcmp(argv[i], "--sample-rate") == 0 && i + 1 < argc) { i++; config.sample_rate = atoi(argv[i]); }
 		else if (strcmp(argv[i], "--center-freq") == 0 && i + 1 < argc) { i++; config.center_freq = atoi(argv[i]); }
 		else if (strcmp(argv[i], "--tuner-gain-mode") == 0 && i + 1 < argc) { i++; config.tuner_gain_mode = atoi(argv[i]); }
 		else if (strcmp(argv[i], "--tuner-gain") == 0 && i + 1 < argc) { i++; config.tuner_gain = atoi(argv[i]); }
 		else if (strcmp(argv[i], "--fft_size") == 0 && i + 1 < argc) { i++; config.fft_size = atoi(argv[i]); }
+		else if (strcmp(argv[i], "--help") == 0)
+		{
+			printf(
+				"\n"
+				"Waterfall-SDR\n"
+				"Usage:\n"
+				"  sudo ./build/waterfall [options]\n\n"
+				"Options:\n"
+				"  --sample-rate <Hz>       Sample rate in Hz (default: 2048000)\n"
+				"  --center-freq <Hz>       Center frequency in Hz (default: 433920000)\n"
+				"  --tuner-gain-mode        0 = auto gain, 1 = manual gain (default: 1)\n"
+				"  --tuner-gain <value>     Tuner gain in tenths of dB (e.g. 400 = 40.0 dB)\n"
+				"  --fft_size <N>           FFT size (must be power of 2 and less than 16kb)\n"
+				"Examples:\n"
+				"  ./build/waterfall\n"
+				"  ./build/waterfall --center-freq 915000000\n"
+				"  ./build/waterfall --sample-rate 2400000 --fft_size 2048\n\n"
+				
+				"  - Requires an RTL-SDR device.\n"
+			);
+
+    exit(0);
+}
+
 		i++;
 	}
 
